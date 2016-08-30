@@ -349,12 +349,12 @@ int main(int argc, char **argv)
 		}
 	} while (flags[++i].name);
 
-      out_success:
+out_success:
 	logSuccess(argv[0]);
 	iRc = 0;
-      out_close:
+out_close:
 	contextClose(hContext);
-      out:
+out:
     if (szTpmPasswd && !isWellKnown)
 	shredPasswd( szTpmPasswd );
 	return iRc;
