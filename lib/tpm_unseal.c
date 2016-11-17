@@ -408,8 +408,8 @@ int tpmUnsealFile( char* fname, unsigned char** tss_data, int* tss_size,
 	}
 
 	/* Decode and decrypt the encrypted data */
-	EVP_CIPHER_CTX ctx;
-	EVP_DecryptInit(&ctx, EVP_aes_256_cbc(), symKey, (unsigned char *)TPMSEAL_IV);
+	EVP_CIPHER_CTX *ctx = NULL;
+	EVP_DecryptInit(ctx, EVP_aes_256_cbc(), symKey, (unsigned char *)TPMSEAL_IV);
 
 	/* Create a base64 BIO to decode the encrypted data */
 	if ((b64 = BIO_new(BIO_f_base64())) == NULL) {
@@ -420,11 +420,11 @@ int tpmUnsealFile( char* fname, unsigned char** tss_data, int* tss_size,
 
 	bmem = BIO_push( b64, bmem );
 	while ((rcLen = BIO_read(bmem, data, sizeof(data))) > 0) {
-		EVP_DecryptUpdate(&ctx, res_data+res_size,
+		EVP_DecryptUpdate(ctx, res_data+res_size,
 					&rcLen, (unsigned char *)data, rcLen);
 		res_size += rcLen;
 	}
-	EVP_DecryptFinal(&ctx, res_data+res_size, &rcLen);
+	EVP_DecryptFinal(ctx, res_data+res_size, &rcLen);
 	res_size += rcLen;
 	bmem = BIO_pop(b64);
 	BIO_free(b64);
