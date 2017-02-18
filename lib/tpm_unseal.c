@@ -408,7 +408,7 @@ int tpmUnsealFile( char* fname, unsigned char** tss_data, int* tss_size,
 	}
 
 	/* Decode and decrypt the encrypted data */
-	EVP_CIPHER_CTX *ctx = NULL;
+	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
 	EVP_DecryptInit(ctx, EVP_aes_256_cbc(), symKey, (unsigned char *)TPMSEAL_IV);
 
 	/* Create a base64 BIO to decode the encrypted data */
