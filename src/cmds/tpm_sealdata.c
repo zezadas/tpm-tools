@@ -18,8 +18,11 @@
  * along with this program; if not, a copy can be viewed at
  * http://www.opensource.org/licenses/cpl1.0.php.
  */
-#include <openssl/evp.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
 #include <limits.h>
+#include <openssl/evp.h>
 #include "tpm_tspi.h"
 #include "tpm_utils.h"
 #include "tpm_seal.h"
@@ -33,9 +36,9 @@ static void help(const char *aCmd)
 	logCmdOption("-o, --outfile FILE",
 		     _
 		     ("Filename to write sealed key to.  Default is STDOUT."));
-	logCmdOption("-p, --pcr NUMBER",
+	logCmdOption("-p, --pcr NUMBER[=VALUE]",
 		     _
-		     ("PCR to seal data to.  Default is none.  This option can be specified multiple times to choose more than one PCR."));
+		     ("PCR to seal data to.  Default is none.  This option can be specified multiple times to choose more than one PCR. If value is specified, 40 hexdigits (the PCR contents) should follow, otherwise the default value will be used instead"));
 	logCmdOption("-z, --well-known", _("Use TSS_WELL_KNOWN_SECRET as the SRK secret."));
 	logCmdOption("-u, --unicode", _("Use TSS UNICODE encoding for the SRK password to comply with applications using TSS popup boxes"));
 
@@ -44,11 +47,96 @@ static void help(const char *aCmd)
 static char in_filename[PATH_MAX] = "", out_filename[PATH_MAX] = "";
 static TSS_HPCRS hPcrs = NULL_HPCRS;
 static TSS_HTPM hTpm;
-static UINT32 selectedPcrs[24];
-static UINT32 selectedPcrsLen = 0;
+#define PCR_SIZE 20
+#define MAX_PCRS 24
+static UINT32 selectedPcrs = 0;
+static UINT32 valuedPcrs = 0;
+static BYTE valueForPcrs[MAX_PCRS][PCR_SIZE];
 static BOOL passUnicode = FALSE;
 static BOOL isWellKnown = FALSE;
 TSS_HCONTEXT hContext = 0;
+
+static int init_flag(UINT32 *vector) {
+	*vector = 0;
+	return 0;
+}
+
+static int set_flag(UINT32 *vector, UINT32 flag) {
+	if (flag >= 32)
+		return 1;
+	*vector |= ((UINT32)1)<<flag;
+	return 0;
+}
+
+static int clear_flag(UINT32 *vector, UINT32 flag) {
+	if (flag >= 32)
+		return 1;
+	*vector &= ~(((UINT32)1)<<flag);
+	return 0;
+}
+
+static int get_flag(UINT32 *vector, UINT32 flag) {
+	if (flag >= 32)
+		return 0;
+	return *vector & (((UINT32)1)<<flag);
+}
+
+/*Test all flags >= start and < end)*/
+static int test_flag_range(UINT32 *vector, UINT32 start, UINT32 end) {
+	UINT32 mask = 0;
+	if (start < 32) {
+		mask = (~(UINT32)0) << start;
+	}
+	if (end < 32) {
+		mask &= ~ ((~(UINT32)0) << end);
+	}
+	return (*vector & mask) != 0;
+}
+
+static int parse_pcr(const char *aArg) {
+	UINT32 pcrid;
+	BYTE pcrvb;
+	char *endptr;
+	char hx[3];
+	int i;
+	if (*aArg == '\0')
+		return 1;
+	errno = 0;
+	pcrid = strtol(aArg,&endptr,10);
+	if (errno != 0)
+		return 1;
+	switch (*endptr) {
+		case '=':
+			aArg = endptr+1;
+			if (strlen(aArg) != PCR_SIZE*2)
+				return 1;
+			if (pcrid > MAX_PCRS)
+				return 1;
+			hx[2] = '\0';
+			for (i = 0; i < PCR_SIZE; i++) {
+				hx[0] = aArg[i*2];
+				hx[1] = aArg[i*2+1];
+				errno = 0;
+				pcrvb = strtol(hx,&endptr,16);
+				if (errno != 0)
+					return 1;
+				if (endptr != hx+2)
+					return 1;
+				valueForPcrs[pcrid][i] = pcrvb;
+			}
+			/* Finally mark the chosen PCR as having a custom value */
+			set_flag(&valuedPcrs,pcrid);
+			break;
+		case '\0':
+			clear_flag(&valuedPcrs,pcrid);
+			break;
+		default:
+			return 1;
+	}
+	/* Mark the PCR to be used */
+	set_flag(&selectedPcrs,pcrid);
+	return 0;
+}
 
 static int parse(const int aOpt, const char *aArg)
 {
@@ -69,8 +157,9 @@ static int parse(const int aOpt, const char *aArg)
 		break;
 	case 'p':
 		if (aArg) {
-			selectedPcrs[selectedPcrsLen++] = atoi(aArg);
-			rc = 0;
+			rc= parse_pcr(aArg);
+		} else {
+			rc = 1;
 		}
 		break;
 	case 'u':
@@ -123,6 +212,9 @@ int main(int argc, char **argv)
 
 	initIntlSys();
 
+	init_flag(&selectedPcrs);
+	init_flag(&valuedPcrs);
+
 	if (genericOptHandler(argc, argv, "i:o:p:uz", opts,
 			      sizeof(opts) / sizeof(struct option), parse,
 			      help) != 0)
@@ -154,33 +246,40 @@ int main(int argc, char **argv)
 
 	/* Create the PCRs object. If any PCRs above 15 are selected, this will need to be
 	 * a 1.2 TSS/TPM */
-	if (selectedPcrsLen) {
+	if (test_flag_range(&selectedPcrs,0,MAX_PCRS)) {
 		TSS_FLAG initFlag = 0;
 		UINT32 pcrSize;
 		BYTE *pcrValue;
 
-		for (i = 0; i < selectedPcrsLen; i++) {
-			if (selectedPcrs[i] > 15) {
+		if (test_flag_range(&selectedPcrs,16,MAX_PCRS)) {
 #ifdef TSS_LIB_IS_12
-				initFlag |= TSS_PCRS_STRUCT_INFO_LONG;
+			initFlag |= TSS_PCRS_STRUCT_INFO_LONG;
 #else
-				logError(_("This version of %s was compiled for a v1.1 TSS, which "
-					 "can only seal\n data to PCRs 0-15. PCR %u is out of range"
-					 "\n"), argv[0], selectedPcrs[i]);
-				goto out_close;
+			logError(_("This version of %s was compiled for a v1.1 TSS, which "
+					"can only seal\n data to PCRs 0-15. PCR %u is out of range"
+					"\n"), argv[0], selectedPcrs[i]);
+			goto out_close;
 #endif
-			}
 		}
 
 		if (contextCreateObject(hContext, TSS_OBJECT_TYPE_PCRS, initFlag,
 					&hPcrs) != TSS_SUCCESS)
 			goto out_close;
 
-		for (i = 0; i < selectedPcrsLen; i++) {
-			if (tpmPcrRead(hTpm, selectedPcrs[i], &pcrSize, &pcrValue) != TSS_SUCCESS)
-				goto out_close;
-
-			if (pcrcompositeSetPcrValue(hPcrs, selectedPcrs[i], pcrSize, pcrValue)
+		for (i = 0; i < MAX_PCRS; i++) {
+			/* If the PCR is not selected continue on the next one */
+			if (!get_flag(&selectedPcrs,i))
+				continue;
+			if (!get_flag(&valuedPcrs,i)) {
+				/* Read the value from the TPM if not user set */
+				if (tpmPcrRead(hTpm, i, &pcrSize, &pcrValue) != TSS_SUCCESS)
+					goto out_close;
+			} else {
+				/* Use the user provided value */
+				pcrValue = valueForPcrs[i];
+				pcrSize = PCR_SIZE;
+			}
+			if (pcrcompositeSetPcrValue(hPcrs, i, pcrSize, pcrValue)
 					!= TSS_SUCCESS)
 				goto out_close;
 		}
